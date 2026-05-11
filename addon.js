@@ -8,6 +8,16 @@ const PORT = process.env.PORT || 7860;
 const BASE_URL = process.env.PB_BASE_URL || "https://pimpbunny.com";
 const PUBLIC_BASE_URL = process.env.SPACE_URL || process.env.PUBLIC_URL || "";
 
+// Hardcoded lightweight catalog / bandwidth settings.
+// Keep image proxying off by default so catalog posters load directly from the image host.
+const PROXY_IMAGES = false;
+
+// Even if /imgproxy is used later, do not spend outbound proxy bandwidth on poster images.
+const IMAGE_PROXY_USES_OUTBOUND_PROXY = false;
+
+// Keep catalog pages lighter.
+const CATALOG_ITEM_LIMIT = 32;
+
 const PROXY_HOST = process.env.OUTBOUND_PROXY_HOST || "";
 const PROXY_PORT_ENV = process.env.OUTBOUND_PROXY_PORT || "";
 const PROXY_USER = process.env.OUTBOUND_PROXY_USERNAME || "";
@@ -19,7 +29,7 @@ const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : null;
 
 const MAX_RESOLVE_CANDIDATES = 4;
 const STREAM_CACHE_MS = 45 * 1000;
-const CATALOG_CACHE_MS = 10 * 60 * 1000;
+const CATALOG_CACHE_MS = 30 * 60 * 1000;
 const META_CACHE_MS = 10 * 60 * 1000;
 
 // If /proxy is used manually, do not send video bytes through the outbound proxy.
@@ -102,7 +112,7 @@ function hasFreshResolvedStreams(id) {
   );
 }
 
-function startStreamPrewarm(id) {
+function startStreamPrewarm(id, snapshot = null) {
   if (!ENABLE_META_STREAM_PREWARM) return null;
 
   if (hasFreshResolvedStreams(id)) {
@@ -118,7 +128,34 @@ function startStreamPrewarm(id) {
 
   console.log(`[prewarm] starting lightweight stream resolve for ${id}`);
 
-  const promise = scrapeMetaById(id, { resolveStreams: true })
+  const runPrewarm = async () => {
+    // Best path: reuse the HTML already fetched by metadata.
+    // This saves one full proxied page fetch per selected video.
+    if (snapshot && snapshot.html && snapshot.pageUrl) {
+      const videoUrls = await resolveVideoUrlsFromHtml(
+        snapshot.html,
+        snapshot.pageUrl,
+        snapshot.videoId,
+        snapshot.cookieStr || ""
+      );
+
+      const result = {
+        meta: snapshot.meta || null,
+        videoUrl: videoUrls[0] || null,
+        videoUrls,
+        cookieStr: snapshot.cookieStr || "",
+        updatedAt: Date.now(),
+      };
+
+      metaCache.set(id, result);
+      return result;
+    }
+
+    // Fallback path for cached metadata that does not have HTML attached.
+    return scrapeMetaById(id, { resolveStreams: true });
+  };
+
+  const promise = runPrewarm()
     .then(result => {
       console.log(
         `[prewarm] done for ${id}: ${result?.videoUrls?.length || 0} playable URL(s)`
@@ -370,10 +407,12 @@ function extractPostCards(html, baseUrl) {
       !/(placeholder|avatar|logo|icon|blank|spacer|pixel|\.gif)/i.test(rawImg);
 
     const img = imgOk
-      ? (PUBLIC_BASE_URL
-          ? `${PUBLIC_BASE_URL}/imgproxy?url=${encodeURIComponent(rawImg)}`
-          : rawImg)
-      : undefined;
+  ? (
+      PROXY_IMAGES && PUBLIC_BASE_URL
+        ? `${PUBLIC_BASE_URL}/imgproxy?url=${encodeURIComponent(rawImg)}`
+        : rawImg
+    )
+  : undefined;
 
     const description = cleanCatalogText(
       container
@@ -399,11 +438,11 @@ function extractPostCards(html, baseUrl) {
   });
 
   console.log(`[catalog] extractPostCards found ${results.length} video items`);
-  return results.slice(0, 24);
+  return results.slice(0, CATALOG_ITEM_LIMIT);
 }
 
 async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
-  const page = Math.floor((Number(skip) || 0) / 24) + 1;
+  const page = Math.floor((Number(skip) || 0) / CATALOG_ITEM_LIMIT) + 1;
 
   if (search) {
     const searchUrls = [
@@ -844,6 +883,7 @@ async function scrapeMetaById(id, options = {}) {
 
   if (!resolveStreams) {
     console.log(`[meta] metadata-only request; stream resolving skipped`);
+
     metaCache.set(id, {
       meta,
       videoUrl: null,
@@ -851,21 +891,39 @@ async function scrapeMetaById(id, options = {}) {
       cookieStr,
       updatedAt: Date.now(),
     });
-    return { meta, videoUrl: null, videoUrls: [], cookieStr };
+
+    // Return the fetched HTML too, so prewarm can reuse it instead of fetching
+    // the same page again through the outbound proxy.
+    return {
+      meta,
+      videoUrl: null,
+      videoUrls: [],
+      cookieStr,
+      html,
+      pageUrl,
+      videoId,
+    };
   }
 
   const videoUrls = await resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr);
   const videoUrl = videoUrls[0] || null;
 
-  metaCache.set(id, {
+  const result = {
     meta,
     videoUrl,
     videoUrls,
     cookieStr,
     updatedAt: Date.now(),
-  });
+  };
 
-  return { meta, videoUrl, videoUrls, cookieStr };
+  metaCache.set(id, result);
+
+  return {
+    ...result,
+    html,
+    pageUrl,
+    videoId,
+  };
 }
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
@@ -905,21 +963,20 @@ builder.defineMetaHandler(async ({ type, id }) => {
   try {
     const cached = metaCache.get(id);
 
-    if (cached && cached.meta && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
-      // Stremio opened the video details page. Start resolving streams immediately,
-      // but do not block the meta response.
+    if (cached && cached.meta && Date.now() - cached.updatedAt < META_CACHE_MS) {
+      // If streams are not fresh yet, start/continue prewarm.
       startStreamPrewarm(id);
 
       return { meta: cached.meta };
     }
 
-    const { meta } = await scrapeMetaById(id, { resolveStreams: false });
+    const result = await scrapeMetaById(id, { resolveStreams: false });
 
-    // Start lightweight stream resolving immediately after metadata is available.
-    // This runs in parallel so the meta page can still load fast.
-    startStreamPrewarm(id);
+    // Reuse the HTML already fetched by scrapeMetaById instead of fetching
+    // the same page again.
+    startStreamPrewarm(id, result);
 
-    return { meta };
+    return { meta: result.meta };
   } catch (err) {
     console.error("Meta error:", err.message);
 
@@ -1069,7 +1126,16 @@ app.get("/imgproxy", async (req, res) => {
   if (!target) return res.status(400).send("missing url");
 
   try {
-    const upstream = await doFetch(target, { headers: { ...HEADERS, Referer: BASE_URL + "/" } }, true);
+    const upstream = await doFetch(
+  target,
+  {
+    headers: {
+      ...HEADERS,
+      Referer: BASE_URL + "/",
+    },
+  },
+  IMAGE_PROXY_USES_OUTBOUND_PROXY
+);
     if (!upstream.ok) return res.status(upstream.status).send(`upstream ${upstream.status}`);
 
     res.setHeader("Content-Type", upstream.headers.get("content-type") || "image/jpeg");
