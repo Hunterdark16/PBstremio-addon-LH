@@ -85,6 +85,58 @@ const builder = new addonBuilder(manifest);
 const metaCache = new Map();
 const catalogCache = new Map();
 
+// Starts lightweight stream resolving as soon as Stremio opens the meta page.
+// This is intentionally lightweight: it uses your existing scrapeMetaById(... resolveStreams: true)
+// and does not add Puppeteer/browser logic.
+const ENABLE_META_STREAM_PREWARM = process.env.ENABLE_META_STREAM_PREWARM !== "0";
+const streamPrewarmPromises = new Map();
+
+function hasFreshResolvedStreams(id) {
+  const cached = metaCache.get(id);
+
+  return (
+    cached &&
+    cached.videoUrls &&
+    cached.videoUrls.length > 0 &&
+    Date.now() - cached.updatedAt < STREAM_CACHE_MS
+  );
+}
+
+function startStreamPrewarm(id) {
+  if (!ENABLE_META_STREAM_PREWARM) return null;
+
+  if (hasFreshResolvedStreams(id)) {
+    console.log(`[prewarm] stream cache already fresh for ${id}`);
+    return Promise.resolve(metaCache.get(id));
+  }
+
+  const existing = streamPrewarmPromises.get(id);
+  if (existing) {
+    console.log(`[prewarm] already running for ${id}`);
+    return existing;
+  }
+
+  console.log(`[prewarm] starting lightweight stream resolve for ${id}`);
+
+  const promise = scrapeMetaById(id, { resolveStreams: true })
+    .then(result => {
+      console.log(
+        `[prewarm] done for ${id}: ${result?.videoUrls?.length || 0} playable URL(s)`
+      );
+      return result;
+    })
+    .catch(err => {
+      console.warn(`[prewarm] failed for ${id}: ${err.message}`);
+      return null;
+    })
+    .finally(() => {
+      streamPrewarmPromises.delete(id);
+    });
+
+  streamPrewarmPromises.set(id, promise);
+  return promise;
+}
+
 setInterval(() => {
   const now = Date.now();
 
@@ -852,14 +904,25 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
   try {
     const cached = metaCache.get(id);
-    if (cached && cached.meta && Date.now() - cached.updatedAt < META_CACHE_MS) {
+
+    if (cached && cached.meta && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
+      // Stremio opened the video details page. Start resolving streams immediately,
+      // but do not block the meta response.
+      startStreamPrewarm(id);
+
       return { meta: cached.meta };
     }
 
     const { meta } = await scrapeMetaById(id, { resolveStreams: false });
+
+    // Start lightweight stream resolving immediately after metadata is available.
+    // This runs in parallel so the meta page can still load fast.
+    startStreamPrewarm(id);
+
     return { meta };
   } catch (err) {
     console.error("Meta error:", err.message);
+
     return {
       meta: {
         id,
@@ -909,24 +972,77 @@ builder.defineStreamHandler(async ({ type, id }) => {
       Date.now() - cached.updatedAt < STREAM_CACHE_MS
     ) {
       console.log(`[stream] short cache hit for ${id}`);
-      return { streams: buildStreamObjects(cached.videoUrls) };
+
+      const streams = buildStreamObjects(
+        cached.videoUrls,
+        pageUrl,
+        cached.cookieStr || ""
+      );
+
+      return { streams };
+    }
+
+    const prewarmPromise = streamPrewarmPromises.get(id);
+
+    if (prewarmPromise) {
+      console.log(`[stream] awaiting in-flight prewarm for ${id}`);
+
+      const prewarmed = await prewarmPromise;
+
+      if (prewarmed && prewarmed.videoUrls && prewarmed.videoUrls.length > 0) {
+        console.log(`[stream] using prewarmed streams for ${id}`);
+
+        const streams = buildStreamObjects(
+          prewarmed.videoUrls,
+          pageUrl,
+          prewarmed.cookieStr || ""
+        );
+
+        return { streams };
+      }
+
+      console.log(`[stream] prewarm finished without usable streams for ${id}`);
     }
 
     console.log(`[stream] fresh scrape for ${id}`);
-    const { videoUrls } = await scrapeMetaById(id, { resolveStreams: true });
+
+    const { videoUrls, cookieStr } = await scrapeMetaById(id, {
+      resolveStreams: true,
+    });
 
     if (!videoUrls || videoUrls.length === 0) {
       console.log(`[stream] no playable URLs found`);
-      return { streams: [{ name: "PimpBunny 🔗", title: "Open Page", externalUrl: pageUrl }] };
+
+      return {
+        streams: [
+          {
+            name: "PimpBunny 🔗",
+            title: "Open Page",
+            externalUrl: pageUrl,
+          },
+        ],
+      };
     }
 
-    const streams = buildStreamObjects(videoUrls);
+    const streams = buildStreamObjects(videoUrls, pageUrl, cookieStr || "");
 
-    console.log(`[stream] returning ${streams.length} stream(s), first: ${streams[0]?.url?.substring(0, 100)}`);
+    console.log(
+      `[stream] returning ${streams.length} stream(s), first: ${streams[0]?.url?.substring(0, 80)}`
+    );
+
     return { streams };
   } catch (err) {
     console.error(`[stream] error ${id}:`, err.message);
-    return { streams: [{ name: "PimpBunny 🔗", title: "Open Page", externalUrl: pageUrl }] };
+
+    return {
+      streams: [
+        {
+          name: "PimpBunny 🔗",
+          title: "Open Page",
+          externalUrl: pageUrl,
+        },
+      ],
+    };
   }
 });
 
